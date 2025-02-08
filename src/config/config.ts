@@ -1,4 +1,5 @@
 interface Config {
+  nodeEnv: string;
   logLevel: string;
   server: {
     port: number;
@@ -18,6 +19,7 @@ interface Config {
 }
 
 const config: Config = {
+  nodeEnv: process.env.NODE_ENV || 'development',
   logLevel: process.env.LOG_LEVEL || 'info',
   server: {
     port: Number(process.env.PORT) || 3000,

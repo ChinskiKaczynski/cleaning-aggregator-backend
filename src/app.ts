@@ -17,13 +17,17 @@ export async function build(): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
       level: config.logLevel,
-      transport: {
-        target: 'pino-pretty',
-        options: {
-          translateTime: 'HH:MM:ss Z',
-          ignore: 'pid,hostname',
-        },
-      },
+      ...(config.nodeEnv === 'development'
+        ? {
+            transport: {
+              target: 'pino-pretty',
+              options: {
+                translateTime: 'HH:MM:ss Z',
+                ignore: 'pid,hostname',
+              },
+            },
+          }
+        : {}),
     },
   }).withTypeProvider<TypeBoxTypeProvider>();
 
