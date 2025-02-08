@@ -1,211 +1,93 @@
-import fetch from 'node-fetch';
+import { load } from 'cheerio';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import type { RequestInit } from 'node-fetch';
+import fetch, { RequestInit } from 'node-fetch';
+import { ProxyRotator } from './proxy';
 
-const userAgents = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0.0.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0',
-  'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/120.0'
-];
-
-export class UserAgentRotator {
-  private currentIndex: number = 0;
-
-  constructor(private agents: string[] = userAgents) {
-    this.shuffle();
-  }
-
-  public next(): string {
-    const agent = this.agents[this.currentIndex];
-    this.currentIndex = (this.currentIndex + 1) % this.agents.length;
-    return agent;
-  }
-
-  private shuffle(): void {
-    for (let i = this.agents.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [this.agents[i], this.agents[j]] = [this.agents[j], this.agents[i]];
-    }
-  }
-}
-
-export interface Proxy {
-  host: string;
-  port: number;
-  auth?: {
-    username: string;
-    password: string;
-  };
-  maxRequestsPerMinute: number;
-  maxRequestsPerDay: number;
-}
-
-interface ProxyUsage {
-  proxy: Proxy;
-  requestsThisMinute: number;
-  requestsToday: number;
-  lastMinuteTimestamp: number;
-  lastDayTimestamp: number;
-  consecutiveFailures: number;
-  isBlocked: boolean;
-  lastUsed: number;
-}
-
-export class ProxyRotator {
-  private proxyUsage: ProxyUsage[] = [];
-  private currentIndex: number = 0;
-  private readonly MAX_CONSECUTIVE_FAILURES = 3;
-  private readonly BLOCK_DURATION = 30 * 60 * 1000; // 30 minut
+export class Agent {
+  private proxyRotator: ProxyRotator;
 
   constructor() {
-    this.loadProxiesFromConfig();
-    this.startUsageResetTimer();
+    this.proxyRotator = new ProxyRotator();
   }
 
-  private loadProxiesFromConfig(): void {
-    try {
-      const proxyListEnv = process.env.PROXY_LIST;
-      if (!proxyListEnv) {
-        console.warn('PROXY_LIST nie skonfigurowana');
-        return;
-      }
+  protected async fetch(url: string, options: RequestInit = {}): Promise<string> {
+    const proxy = this.proxyRotator.next();
+    let attempts = 0;
+    const maxAttempts = 3;
 
-      const proxies: Proxy[] = JSON.parse(proxyListEnv);
-      this.proxyUsage = proxies.map(proxy => ({
-        proxy,
-        requestsThisMinute: 0,
-        requestsToday: 0,
-        lastMinuteTimestamp: Date.now(),
-        lastDayTimestamp: Date.now(),
-        consecutiveFailures: 0,
-        isBlocked: false,
-        lastUsed: 0
-      }));
+    while (attempts < maxAttempts) {
+      try {
+        let fetchOptions: RequestInit = {
+          ...options,
+          headers: {
+            'User-Agent': this.getRandomUserAgent(),
+            ...options.headers,
+          },
+          timeout: 10000,
+        };
 
-      console.log(`Załadowano ${proxies.length} proxy`);
-    } catch (error) {
-      console.error('Błąd podczas ładowania proxy:', error);
-    }
-  }
-
-  private startUsageResetTimer(): void {
-    // Reset liczników co minutę
-    setInterval(() => {
-      const now = Date.now();
-      this.proxyUsage.forEach(usage => {
-        // Reset licznika minutowego
-        if (now - usage.lastMinuteTimestamp >= 60000) {
-          usage.requestsThisMinute = 0;
-          usage.lastMinuteTimestamp = now;
+        if (proxy) {
+          const proxyUrl = `http://${proxy.auth.username ? `${proxy.auth.username}:${proxy.auth.password}@` : ''}${proxy.host}:${proxy.port}`;
+          // @ts-ignore
+          fetchOptions.agent = new HttpsProxyAgent(proxyUrl);
         }
-        // Reset licznika dziennego
-        if (now - usage.lastDayTimestamp >= 86400000) {
-          usage.requestsToday = 0;
-          usage.lastDayTimestamp = now;
+
+        const response = await fetch(url, fetchOptions);
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
         }
-        // Odblokuj proxy po czasie
-        if (usage.isBlocked && now - usage.lastUsed >= this.BLOCK_DURATION) {
-          usage.isBlocked = false;
-          usage.consecutiveFailures = 0;
+
+        const content = await response.text();
+        if (proxy) {
+          this.proxyRotator.reportSuccess(proxy);
         }
-      });
-    }, 60000);
-  }
+        return content;
 
-  public next(): Proxy | null {
-    if (this.proxyUsage.length === 0) return null;
-
-    // Znajdź następne dostępne proxy
-    for (let i = 0; i < this.proxyUsage.length; i++) {
-      const index = (this.currentIndex + i) % this.proxyUsage.length;
-      const usage = this.proxyUsage[index];
-
-      if (this.canUseProxy(usage)) {
-        this.currentIndex = (index + 1) % this.proxyUsage.length;
-        this.updateProxyUsage(usage);
-        return usage.proxy;
+      } catch (error) {
+        attempts++;
+        if (proxy) {
+          this.proxyRotator.reportFailure(proxy);
+        }
+        
+        if (attempts === maxAttempts) {
+          throw new Error(`Failed to fetch ${url} after ${maxAttempts} attempts: ${error}`);
+        }
+        
+        // Czekaj przed kolejną próbą
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
       }
     }
 
-    console.warn('Brak dostępnych proxy!');
-    return null;
+    throw new Error('Unreachable code - loop should have either returned or thrown');
   }
 
-  private canUseProxy(usage: ProxyUsage): boolean {
-    const { proxy, requestsThisMinute, requestsToday, isBlocked } = usage;
-
-    return !isBlocked &&
-           requestsThisMinute < proxy.maxRequestsPerMinute &&
-           requestsToday < proxy.maxRequestsPerDay;
+  protected $(html: string) {
+    return load(html);
   }
 
-  private updateProxyUsage(usage: ProxyUsage): void {
-    usage.requestsThisMinute++;
-    usage.requestsToday++;
-    usage.lastUsed = Date.now();
+  private getRandomUserAgent(): string {
+    const userAgents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59'
+    ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
   }
+}
 
-  public reportSuccess(proxy: Proxy): void {
-    const usage = this.getProxyUsage(proxy);
-    if (usage) {
-      usage.consecutiveFailures = 0;
-    }
-  }
+// Przykładowa implementacja dla konkretnej strony
+export class ExampleSiteAgent extends Agent {
+  async scrapeCompanyDetails(url: string) {
+    const html = await this.fetch(url);
+    const $ = this.$(html);
 
-  public reportFailure(proxy: Proxy): void {
-    const usage = this.getProxyUsage(proxy);
-    if (usage) {
-      usage.consecutiveFailures++;
-      if (usage.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
-        usage.isBlocked = true;
-        console.warn(`Proxy ${proxy.host}:${proxy.port} zablokowane po ${usage.consecutiveFailures} nieudanych próbach`);
-      }
-    }
-  }
-
-  private getProxyUsage(proxy: Proxy): ProxyUsage | undefined {
-    return this.proxyUsage.find(u => 
-      u.proxy.host === proxy.host && 
-      u.proxy.port === proxy.port
-    );
-  }
-
-  public async checkProxy(proxy: Proxy): Promise<boolean> {
-    try {
-      const proxyUrl = `http://${proxy.auth ? `${proxy.auth.username}:${proxy.auth.password}@` : ''}${proxy.host}:${proxy.port}`;
-      const proxyAgent = new HttpsProxyAgent(proxyUrl);
-
-      const response = await fetch('http://example.com', {
-        agent: proxyAgent,
-        timeout: 5000
-      });
-
-      return response.ok;
-    } catch (error) {
-      console.error(`Proxy ${proxy.host}:${proxy.port} niedostępne:`, error);
-      return false;
-    }
-  }
-
-  public getStats(): Array<{
-    host: string;
-    requests: { minute: number; day: number };
-    status: string;
-  }> {
-    return this.proxyUsage.map(usage => ({
-      host: usage.proxy.host,
-      requests: {
-        minute: usage.requestsThisMinute,
-        day: usage.requestsToday
-      },
-      status: usage.isBlocked ? 'blocked' : 
-              this.canUseProxy(usage) ? 'available' : 'limited'
-    }));
+    return {
+      name: $('.company-name').text().trim(),
+      description: $('.company-description').text().trim(),
+      // ... więcej pól
+    };
   }
 }

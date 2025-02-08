@@ -16,6 +16,12 @@ interface Config {
   redis: {
     url: string;
   };
+  proxy: {
+    enabled: boolean;
+    list: string;
+    retryAttempts: number;
+    timeoutMs: number;
+  };
 }
 
 const config: Config = {
@@ -36,6 +42,12 @@ const config: Config = {
   redis: {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
   },
+  proxy: {
+    enabled: process.env.PROXY_ENABLED === 'true',
+    list: process.env.PROXY_LIST || '[]',
+    retryAttempts: Number(process.env.PROXY_RETRY_ATTEMPTS) || 3,
+    timeoutMs: Number(process.env.PROXY_TIMEOUT_MS) || 10000,
+  }
 };
 
 // Walidacja wymaganych zmiennych środowiskowych
